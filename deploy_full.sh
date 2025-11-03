@@ -1,81 +1,116 @@
 #!/bin/sh
-# Complete Router Monitoring Setup - No crontab dependencies
-
+# Idempotent Router Monitoring Setup - Safe for multiple runs
 PHONE_IP='192.168.1.13'
 PORT='8081'
 
 send_log() {
     level="$1"
     message="$2"
-    (
-        printf 'POST /log-message HTTP/1.1\r\n'
-        printf 'Host: %s:%s\r\n' "$PHONE_IP" "$PORT"
-        printf 'X-Log-Level: %s\r\n' "$level"
-        printf 'Content-Length: %s\r\n' "$(printf "%s" "$message" | wc -c)"
-        printf 'Content-Type: text/plain\r\n'
-        printf 'Connection: close\r\n\r\n'
-        printf "%s" "$message"
-    ) | nc -w 3 "$PHONE_IP" "$PORT" >/dev/null 2>&1
+    length=$(echo -n "$message" | wc -c)
+    {
+        echo "POST /log-message HTTP/1.1"
+        echo "Host: $PHONE_IP:$PORT"
+        echo "X-Log-Level: $level"
+        echo "Content-Length: $length"
+        echo "Content-Type: text/plain"
+        echo "Connection: close"
+        echo
+        echo "$message"
+    } | nc -w 3 "$PHONE_IP" "$PORT" >/dev/null 2>&1
 }
 
-# === IP TRAFFIC MONITOR SETUP ===
-setup_ip_traffic_monitor() {
-    send_log "INFO" "Setting up IP Traffic Monitor..."
-    
-    BASE_DIR="/tmp/ip_traffic"
-    mkdir -p "$BASE_DIR"
-    
-    # Create the main iptables chains (ONLY ONCE during deployment)
-    iptables -L TRAFFIC_TEST >/dev/null 2>&1 || iptables -N TRAFFIC_TEST
-    iptables -C INPUT -j TRAFFIC_TEST >/dev/null 2>&1 || iptables -I INPUT -j TRAFFIC_TEST
-    iptables -C FORWARD -j TRAFFIC_TEST >/dev/null 2>&1 || iptables -I FORWARD -j TRAFFIC_TEST
-    
-    send_log "INFO" "IPTables chains created and hooked"
-    
-    # Create the IP traffic script (rules update happens here)
-    cat > "$BASE_DIR/ip_traffic_auto.sh" <<'IPEOF'
-#!/bin/sh
-BASE_DIR="/tmp/ip_traffic_test"
-OUTFILE="$BASE_DIR/traffic_snapshot_$(date +%Y%m%d_%H%M%S).txt"
-PID_FILE="$BASE_DIR/monitor.pid"
+# === CHECK IF ALREADY RUNNING ===
+if [ -f "/tmp/ip_traffic_test/monitor.pid" ] && kill -0 $(cat "/tmp/ip_traffic_test/monitor.pid") 2>/dev/null; then
+    send_log "INFO" "✅ Monitor already running (PID: $(cat /tmp/ip_traffic_test/monitor.pid)) - Safe to skip"
+    exit 0
+fi
 
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
+send_log "INFO" "🚀 Starting router monitoring deployment..."
 
-update_rules() {
-    log "Refreshing device list..."
-    DEVICES=""
-    [ -f "/proc/net/arp" ] && DEVICES="$DEVICES $(awk 'NR>1&&$3=="0x2"{print $1}' /proc/net/arp)"
-    [ -f "/tmp/dhcp.leases" ] && DEVICES="$DEVICES $(awk '{print $3}' /tmp/dhcp.leases)"
-    DEVICES=$(echo "$DEVICES" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' ')
-    
-    # Flush and recreate device rules (chains already exist from deployment)
-    iptables -F TRAFFIC_TEST
-    
-    for ip in $DEVICES; do
-        # Skip counting local-to-local traffic (RETURN early)
-        iptables -A TRAFFIC_TEST -s "$ip" -d 192.168.0.0/16 -j RETURN
-        iptables -A TRAFFIC_TEST -d "$ip" -s 192.168.0.0/16 -j RETURN
+# === CREATE DIRECTORIES ===
+mkdir -p /tmp/bandwidth /tmp/web_usage /tmp/ip_traffic_test
+send_log "INFO" "📁 Directories created"
+
+# === SETUP IP TRAFFIC MONITOR ===
+send_log "INFO" "🔧 Setting up IP traffic monitoring..."
+
+# Create chains only if they don't exist (idempotent)
+iptables -L TRAFFIC_TEST >/dev/null 2>&1 || iptables -N TRAFFIC_TEST
+iptables -C INPUT -j TRAFFIC_TEST >/dev/null 2>&1 || iptables -I INPUT -j TRAFFIC_TEST
+iptables -C FORWARD -j TRAFFIC_TEST >/dev/null 2>&1 || iptables -I FORWARD -j TRAFFIC_TEST
+
+send_log "INFO" "📊 IPTables chains configured"
+
+# Stop any existing monitor (clean start)
+if [ -f "/tmp/ip_traffic_test/monitor.pid" ]; then
+    OLD_PID=$(cat "/tmp/ip_traffic_test/monitor.pid")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        kill "$OLD_PID" 2>/dev/null
+        send_log "INFO" "🛑 Stopped previous monitor (PID: $OLD_PID)"
+    fi
+    rm -f "/tmp/ip_traffic_test/monitor.pid"
+fi
+
+# Start background monitor
+(
+    while true; do
+        # Refresh device list and rules
+        DEVICES=""
+        [ -f "/proc/net/arp" ] && DEVICES="$DEVICES $(awk 'NR>1 && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $3=="0x2" {print $1}' /proc/net/arp)"
+        [ -f "/tmp/dhcp.leases" ] && DEVICES="$DEVICES $(awk '$3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $3}' /tmp/dhcp.leases)"
+        DEVICES=$(echo "$DEVICES" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' ')
         
-        # Count everything else (Internet traffic)
-        iptables -A TRAFFIC_TEST -s "$ip" -j RETURN
-        iptables -A TRAFFIC_TEST -d "$ip" -j RETURN
+        # Update iptables rules
+        iptables -F TRAFFIC_TEST
+        
+        for ip in $DEVICES; do
+            # Skip local traffic, count internet traffic
+            iptables -A TRAFFIC_TEST -s "$ip" -d 192.168.0.0/16 -j RETURN
+            iptables -A TRAFFIC_TEST -d "$ip" -s 192.168.0.0/16 -j RETURN
+            iptables -A TRAFFIC_TEST -s "$ip" -j RETURN
+            iptables -A TRAFFIC_TEST -d "$ip" -j RETURN
+        done
+        sleep 60
     done
-    log "Refreshed $(echo $DEVICES | wc -w) devices (Internet traffic only)"
+) >/dev/null 2>&1 &
+MONITOR_PID=$!
+echo $MONITOR_PID > /tmp/ip_traffic_test/monitor.pid
+
+send_log "INFO" "📡 IP traffic monitor started (PID: $MONITOR_PID)"
+
+# === SETUP UPLOAD SCRIPT ===
+send_log "INFO" "📤 Setting up upload script..."
+
+cat > /tmp/upload_logs.sh <<'EOF'
+#!/bin/sh
+PHONE_IP='192.168.1.13'
+PORT='8081'
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $*"
 }
 
-# Create enhanced snapshot with Internet-only traffic
-echo "=== Internet Traffic Snapshot ===" > "$OUTFILE"
-echo "Snapshot time: $(date)" >> "$OUTFILE"
-echo "Note: Local LAN traffic (192.168.x.x) is excluded" >> "$OUTFILE"
-echo "" >> "$OUTFILE"
+log "Starting upload cycle..."
+
+# Create bandwidth snapshot
+mkdir -p /tmp/bandwidth
+cat /proc/net/dev > /tmp/bandwidth/bandwidth_snapshot_$(date +%Y%m%d_%H%M%S).txt
+
+# Create IP traffic snapshot (directly in upload script)
+IP_OUTFILE="/tmp/ip_traffic_test/traffic_snapshot_$(date +%Y%m%d_%H%M%S).txt"
+
+echo "=== Internet Traffic Snapshot ===" > "$IP_OUTFILE"
+echo "Snapshot time: $(date)" >> "$IP_OUTFILE"
+echo "Note: Local LAN traffic (192.168.x.x) is excluded" >> "$IP_OUTFILE"
+echo "" >> "$IP_OUTFILE"
 
 # Get device count
 CURRENT_DEVICES=$(iptables -L TRAFFIC_TEST -n 2>/dev/null | grep RETURN | awk '{print $NF}' | grep '^[0-9]' | sort -u | wc -l)
-echo "Monitored devices: $CURRENT_DEVICES" >> "$OUTFILE"
-echo "" >> "$OUTFILE"
+echo "Monitored devices: $CURRENT_DEVICES" >> "$IP_OUTFILE"
+echo "" >> "$IP_OUTFILE"
 
-# === Internet-Only Traffic ===
-echo "==== Internet Traffic per IP ====" >> "$OUTFILE"
+# Generate internet-only traffic report
+echo "==== Internet Traffic per IP ====" >> "$IP_OUTFILE"
 iptables -L TRAFFIC_TEST -v -n 2>/dev/null | awk '
 /^[[:space:]]*[0-9]+/ {
     ip1=""; ip2=""
@@ -105,76 +140,99 @@ END {
         else
             printf "%-15s %7d B\n", ip, t
     }
-}' >> "$OUTFILE"
+}' >> "$IP_OUTFILE"
 
-# Start background monitor if not running
-if [ ! -f "$PID_FILE" ] || ! kill -0 $(cat "$PID_FILE") 2>/dev/null; then
-    ( while true; do update_rules; sleep 60; done ) >/dev/null 2>&1 &
-    echo $! > "$PID_FILE"
-    log "Internet-only monitor started: $!"
-fi
+log "IP traffic snapshot created: $(basename $IP_OUTFILE)"
 
-log "Internet traffic snapshot created: $OUTFILE"
-IPEOF
-    chmod +x "$BASE_DIR/ip_traffic_auto.sh"
-    
-    # Start the monitor
-    "$BASE_DIR/ip_traffic_auto.sh"
-    send_log "INFO" "IP Traffic Monitor started (Internet-only tracking)"
-}
-
-# === UPLOAD SCRIPT SETUP ===  
-deploy_upload_script() {
-    send_log "INFO" "Deploying upload script..."
-    
-    cat > /tmp/upload_logs.sh <<'UPLOADEOF'
-#!/bin/sh
-PHONE_IP='192.168.1.13'
-PORT='8081'
-DIRS='/tmp/bandwidth /tmp/web_usage /tmp/ip_traffic'
-
-# Take bandwidth snapshot
-mkdir -p /tmp/bandwidth
-cat /proc/net/dev > /tmp/bandwidth/bandwidth_snapshot_$(date +%Y%m%d_%H%M%S).txt
-
-# Take IP traffic snapshot
-[ -f "/tmp/ip_traffic/ip_traffic_auto.sh" ] && /tmp/ip_traffic_test/ip_traffic_auto.sh
-
+# Upload function
 send_file() {
     file="$1"
+    if [ ! -f "$file" ]; then
+        log "File not found: $file"
+        return 1
+    fi
+    
     filesize=$(wc -c < "$file")
-    {
+    log "Uploading: $file ($filesize bytes)"
+    
+    if {
         printf 'POST /upload-bandwidth HTTP/1.1\r\n'
         printf 'Host: %s:%s\r\n' "$PHONE_IP" "$PORT"
         printf 'Content-Type: application/octet-stream\r\n'
         printf 'Content-Length: %s\r\n' "$filesize"
         printf 'X-Source-Path: %s\r\n' "$file"
-        printf 'Connection: close\r\n\r\n'
+        printf 'Connection: close\r\n'
+        printf '\r\n'
         cat "$file"
-    } | nc -w 5 "$PHONE_IP" "$PORT" && rm -f "$file"
+    } | nc -w 10 "$PHONE_IP" "$PORT"; then
+        log "✅ Upload successful, deleting $file"
+        rm -f "$file"
+        return 0
+    else
+        log "❌ Upload failed, keeping $file for retry"
+        return 1
+    fi
 }
 
-for DIR in $DIRS; do
-    [ -d "$DIR" ] && for file in "$DIR"/*; do [ -f "$file" ] && send_file "$file"; done
+# Upload bandwidth snapshot
+for file in /tmp/bandwidth/bandwidth_snapshot_*.txt; do
+    [ -f "$file" ] && send_file "$file"
 done
-UPLOADEOF
-    chmod +x /tmp/upload_logs.sh
-    send_log "INFO" "Upload script deployed"
-}
 
-# === INITIAL UPLOAD ===
-run_initial_upload() {
-    send_log "INFO" "Running initial upload..."
-    /tmp/upload_logs.sh
-    send_log "INFO" "Initial upload completed"
-}
+# Upload latest IP traffic snapshot
+LATEST_SNAPSHOT=$(ls -t /tmp/ip_traffic_test/traffic_snapshot_*.txt 2>/dev/null | head -1)
+if [ -n "$LATEST_SNAPSHOT" ] && [ -f "$LATEST_SNAPSHOT" ]; then
+    log "Uploading IP traffic snapshot: $(basename $LATEST_SNAPSHOT)"
+    send_file "$LATEST_SNAPSHOT"
+fi
 
-# === MAIN EXECUTION ===
-send_log "INFO" "Starting complete router monitoring setup..."
+# Upload web usage if any
+if [ -d "/tmp/web_usage" ]; then
+    for file in /tmp/web_usage/*; do
+        [ -f "$file" ] && send_file "$file"
+    done
+fi
 
-setup_ip_traffic_monitor
-deploy_upload_script  
-run_initial_upload
+# Cleanup old snapshots (keep only last 3)
+ls -t /tmp/ip_traffic_test/traffic_snapshot_*.txt 2>/dev/null | tail -n +4 | while read old_file; do
+    rm -f "$old_file"
+done
 
-send_log "INFO" "🎯 Router monitoring system fully deployed and running!"
+log "Upload cycle completed"
 EOF
+
+chmod +x /tmp/upload_logs.sh
+send_log "INFO" "✅ Upload script deployed"
+
+# === CREATE CLEANUP SCRIPT ===
+cat > /tmp/ip_traffic_test/clean_monitor.sh <<'EOF'
+#!/bin/sh
+echo "🧹 Cleaning up IP Traffic Monitor..."
+PID_FILE="/tmp/ip_traffic_test/monitor.pid"
+
+if [ -f "$PID_FILE" ]; then
+    PID=$(cat "$PID_FILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        kill "$PID" 2>/dev/null
+        echo "✅ Stopped monitor (PID: $PID)"
+    fi
+    rm -f "$PID_FILE"
+fi
+
+iptables -D INPUT -j TRAFFIC_TEST 2>/dev/null && echo "✅ Removed from INPUT chain"
+iptables -D FORWARD -j TRAFFIC_TEST 2>/dev/null && echo "✅ Removed from FORWARD chain"
+iptables -F TRAFFIC_TEST 2>/dev/null && echo "✅ Flushed TRAFFIC_TEST chain"
+iptables -X TRAFFIC_TEST 2>/dev/null && echo "✅ Deleted TRAFFIC_TEST chain"
+
+echo "🎯 Cleanup completed"
+EOF
+chmod +x /tmp/ip_traffic_test/clean_monitor.sh
+send_log "INFO" "🧹 Cleanup script created"
+
+# === RUN INITIAL UPLOAD ===
+send_log "INFO" "📊 Running initial upload..."
+/tmp/upload_logs.sh
+
+send_log "INFO" "🎯 Router monitoring system fully deployed and ready!"
+send_log "INFO" "💡 Run '/tmp/upload_logs.sh' manually for immediate data upload"
+send_log "INFO" "💡 Run '/tmp/ip_traffic_test/clean_monitor.sh' to stop monitoring"

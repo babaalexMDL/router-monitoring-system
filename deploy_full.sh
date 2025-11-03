@@ -109,36 +109,34 @@ CURRENT_DEVICES=$(iptables -L TRAFFIC_TEST -n 2>/dev/null | grep RETURN | awk '{
 echo "Monitored devices: $CURRENT_DEVICES" >> "$IP_OUTFILE"
 echo "" >> "$IP_OUTFILE"
 
-# Generate internet-only traffic report
+# === Internet-Only Traffic (FIXED VERSION) ===
 echo "==== Internet Traffic per IP ====" >> "$IP_OUTFILE"
 iptables -L TRAFFIC_TEST -v -n 2>/dev/null | awk '
 /^[[:space:]]*[0-9]+/ {
-    ip1=""; ip2=""
-    for(i=1;i<=NF;i++){
-        if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/){
-            if(ip1=="") ip1=$i
-            else ip2=$i
+    bytes = $2
+    ip_src = $7
+    ip_dst = $8
+    
+    if (bytes > 0) {
+        if (ip_src ~ /^192\.168\./ && ip_dst !~ /^192\.168\./) {
+            internet_bytes[ip_src] += bytes
         }
-    }
-    if(ip1 && ip2 && $2 ~ /^[0-9]+$/){
-        # Only count traffic to/from non-LAN IP (Internet traffic)
-        if(ip1 !~ /^192\.168\./ || ip2 !~ /^192\.168\./){
-            lan_ip=(ip1 ~ /^192\.168\./ ? ip1 : ip2)
-            bytes[lan_ip]+=$2
+        else if (ip_src !~ /^192\.168\./ && ip_dst ~ /^192\.168\./) {
+            internet_bytes[ip_dst] += bytes
         }
     }
 }
 END {
-    for(ip in bytes){
-        t=bytes[ip]
-        if(t>1024*1024*1024)
-            printf "%-15s %7.2f GB\n", ip, t/1024/1024/1024
-        else if(t>1024*1024)
-            printf "%-15s %7.2f MB\n", ip, t/1024/1024
-        else if(t>1024)
-            printf "%-15s %7.2f KB\n", ip, t/1024
+    for (ip in internet_bytes) {
+        total = internet_bytes[ip]
+        if (total > 1024*1024*1024)
+            printf "%-15s %7.2f GB\n", ip, total/1024/1024/1024
+        else if (total > 1024*1024)
+            printf "%-15s %7.2f MB\n", ip, total/1024/1024
+        else if (total > 1024)
+            printf "%-15s %7.2f KB\n", ip, total/1024
         else
-            printf "%-15s %7d B\n", ip, t
+            printf "%-15s %7d B\n", ip, total
     }
 }' >> "$IP_OUTFILE"
 

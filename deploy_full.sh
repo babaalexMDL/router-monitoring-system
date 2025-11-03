@@ -1,6 +1,5 @@
-cat > /tmp/deploy_full.sh <<'EOF'
 #!/bin/sh
-# Complete Router Monitoring Setup - No crontab dependencies
+# Complete Router Monitoring Setup - Just the actual deployment code
 
 PHONE_IP='192.168.1.13'
 PORT='8081'
@@ -124,6 +123,3 @@ deploy_upload_script
 run_initial_upload
 
 send_log "INFO" "🎯 Router monitoring system fully deployed and running!"
-EOF
-
-chmod +x /tmp/deploy_full.sh

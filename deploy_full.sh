@@ -1,5 +1,5 @@
 #!/bin/sh
-# Complete Router Monitoring Setup - Just the actual deployment code
+# Complete Router Monitoring Setup - No crontab dependencies
 
 PHONE_IP='192.168.1.13'
 PORT='8081'
@@ -25,7 +25,14 @@ setup_ip_traffic_monitor() {
     BASE_DIR="/tmp/ip_traffic_test"
     mkdir -p "$BASE_DIR"
     
-    # Create the IP traffic script
+    # Create the main iptables chains (ONLY ONCE during deployment)
+    iptables -L TRAFFIC_TEST >/dev/null 2>&1 || iptables -N TRAFFIC_TEST
+    iptables -C INPUT -j TRAFFIC_TEST >/dev/null 2>&1 || iptables -I INPUT -j TRAFFIC_TEST
+    iptables -C FORWARD -j TRAFFIC_TEST >/dev/null 2>&1 || iptables -I FORWARD -j TRAFFIC_TEST
+    
+    send_log "INFO" "IPTables chains created and hooked"
+    
+    # Create the IP traffic script (rules update happens here)
     cat > "$BASE_DIR/ip_traffic_auto.sh" <<'IPEOF'
 #!/bin/sh
 BASE_DIR="/tmp/ip_traffic_test"
@@ -41,32 +48,79 @@ update_rules() {
     [ -f "/tmp/dhcp.leases" ] && DEVICES="$DEVICES $(awk '{print $3}' /tmp/dhcp.leases)"
     DEVICES=$(echo "$DEVICES" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' ')
     
-    iptables -L TRAFFIC_TEST >/dev/null 2>&1 || iptables -N TRAFFIC_TEST
-    iptables -C INPUT -j TRAFFIC_TEST >/dev/null 2>&1 || iptables -I INPUT -j TRAFFIC_TEST
-    iptables -C FORWARD -j TRAFFIC_TEST >/dev/null 2>&1 || iptables -I FORWARD -j TRAFFIC_TEST
+    # Flush and recreate device rules (chains already exist from deployment)
     iptables -F TRAFFIC_TEST
     
     for ip in $DEVICES; do
+        # Skip counting local-to-local traffic (RETURN early)
+        iptables -A TRAFFIC_TEST -s "$ip" -d 192.168.0.0/16 -j RETURN
+        iptables -A TRAFFIC_TEST -d "$ip" -s 192.168.0.0/16 -j RETURN
+        
+        # Count everything else (Internet traffic)
         iptables -A TRAFFIC_TEST -s "$ip" -j RETURN
         iptables -A TRAFFIC_TEST -d "$ip" -j RETURN
     done
-    log "Refreshed $(echo $DEVICES | wc -w) devices"
+    log "Refreshed $(echo $DEVICES | wc -w) devices (Internet traffic only)"
 }
 
-echo "Traffic snapshot: $(date)" > "$OUTFILE"
-iptables -L TRAFFIC_TEST -v -n 2>/dev/null >> "$OUTFILE"
+# Create enhanced snapshot with Internet-only traffic
+echo "=== Internet Traffic Snapshot ===" > "$OUTFILE"
+echo "Snapshot time: $(date)" >> "$OUTFILE"
+echo "Note: Local LAN traffic (192.168.x.x) is excluded" >> "$OUTFILE"
+echo "" >> "$OUTFILE"
 
+# Get device count
+CURRENT_DEVICES=$(iptables -L TRAFFIC_TEST -n 2>/dev/null | grep RETURN | awk '{print $NF}' | grep '^[0-9]' | sort -u | wc -l)
+echo "Monitored devices: $CURRENT_DEVICES" >> "$OUTFILE"
+echo "" >> "$OUTFILE"
+
+# === Internet-Only Traffic ===
+echo "==== Internet Traffic per IP ====" >> "$OUTFILE"
+iptables -L TRAFFIC_TEST -v -n 2>/dev/null | awk '
+/^[[:space:]]*[0-9]+/ {
+    ip1=""; ip2=""
+    for(i=1;i<=NF;i++){
+        if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/){
+            if(ip1=="") ip1=$i
+            else ip2=$i
+        }
+    }
+    if(ip1 && ip2 && $2 ~ /^[0-9]+$/){
+        # Only count traffic to/from non-LAN IP (Internet traffic)
+        if(ip1 !~ /^192\.168\./ || ip2 !~ /^192\.168\./){
+            lan_ip=(ip1 ~ /^192\.168\./ ? ip1 : ip2)
+            bytes[lan_ip]+=$2
+        }
+    }
+}
+END {
+    for(ip in bytes){
+        t=bytes[ip]
+        if(t>1024*1024*1024)
+            printf "%-15s %7.2f GB\n", ip, t/1024/1024/1024
+        else if(t>1024*1024)
+            printf "%-15s %7.2f MB\n", ip, t/1024/1024
+        else if(t>1024)
+            printf "%-15s %7.2f KB\n", ip, t/1024
+        else
+            printf "%-15s %7d B\n", ip, t
+    }
+}' >> "$OUTFILE"
+
+# Start background monitor if not running
 if [ ! -f "$PID_FILE" ] || ! kill -0 $(cat "$PID_FILE") 2>/dev/null; then
     ( while true; do update_rules; sleep 60; done ) >/dev/null 2>&1 &
     echo $! > "$PID_FILE"
-    log "Monitor started: $!"
+    log "Internet-only monitor started: $!"
 fi
+
+log "Internet traffic snapshot created: $OUTFILE"
 IPEOF
     chmod +x "$BASE_DIR/ip_traffic_auto.sh"
     
     # Start the monitor
     "$BASE_DIR/ip_traffic_auto.sh"
-    send_log "INFO" "IP Traffic Monitor started"
+    send_log "INFO" "IP Traffic Monitor started (Internet-only tracking)"
 }
 
 # === UPLOAD SCRIPT SETUP ===  
@@ -123,3 +177,4 @@ deploy_upload_script
 run_initial_upload
 
 send_log "INFO" "🎯 Router monitoring system fully deployed and running!"
+EOF

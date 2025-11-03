@@ -1,6 +1,6 @@
+cat > /tmp/deploy_full.sh <<'EOF'
 #!/bin/sh
-# Complete Router Monitoring Setup - Your original working script
-# This is the EXACT same system you already tested successfully
+# Complete Router Monitoring Setup - No crontab dependencies
 
 PHONE_IP='192.168.1.13'
 PORT='8081'
@@ -26,8 +26,8 @@ setup_ip_traffic_monitor() {
     BASE_DIR="/tmp/ip_traffic_test"
     mkdir -p "$BASE_DIR"
     
-    # Create the IP traffic script (your working version)
-    cat > "$BASE_DIR/ip_traffic_auto.sh" <<'EOF'
+    # Create the IP traffic script
+    cat > "$BASE_DIR/ip_traffic_auto.sh" <<'IPEOF'
 #!/bin/sh
 BASE_DIR="/tmp/ip_traffic_test"
 OUTFILE="$BASE_DIR/traffic_snapshot_$(date +%Y%m%d_%H%M%S).txt"
@@ -62,7 +62,7 @@ if [ ! -f "$PID_FILE" ] || ! kill -0 $(cat "$PID_FILE") 2>/dev/null; then
     echo $! > "$PID_FILE"
     log "Monitor started: $!"
 fi
-EOF
+IPEOF
     chmod +x "$BASE_DIR/ip_traffic_auto.sh"
     
     # Start the monitor
@@ -74,7 +74,7 @@ EOF
 deploy_upload_script() {
     send_log "INFO" "Deploying upload script..."
     
-    cat > /tmp/upload_logs.sh <<'EOF'
+    cat > /tmp/upload_logs.sh <<'UPLOADEOF'
 #!/bin/sh
 PHONE_IP='192.168.1.13'
 PORT='8081'
@@ -104,26 +104,16 @@ send_file() {
 for DIR in $DIRS; do
     [ -d "$DIR" ] && for file in "$DIR"/*; do [ -f "$file" ] && send_file "$file"; done
 done
-EOF
+UPLOADEOF
     chmod +x /tmp/upload_logs.sh
     send_log "INFO" "Upload script deployed"
 }
 
-# === SCHEDULING ===
-setup_scheduling() {
-    send_log "INFO" "Setting up scheduling..."
-    
-    # Add to crontab if not exists
-    if ! crontab -l 2>/dev/null | grep -q "upload_logs.sh"; then
-        (crontab -l 2>/dev/null; echo "*/15 * * * * /tmp/upload_logs.sh") | crontab -
-        send_log "INFO" "Added 15-minute schedule to crontab"
-    fi
-    
-    # Run initial upload
+# === INITIAL UPLOAD ===
+run_initial_upload() {
     send_log "INFO" "Running initial upload..."
     /tmp/upload_logs.sh
-    
-    send_log "INFO" "Scheduling setup complete"
+    send_log "INFO" "Initial upload completed"
 }
 
 # === MAIN EXECUTION ===
@@ -131,6 +121,9 @@ send_log "INFO" "Starting complete router monitoring setup..."
 
 setup_ip_traffic_monitor
 deploy_upload_script  
-setup_scheduling
+run_initial_upload
 
 send_log "INFO" "🎯 Router monitoring system fully deployed and running!"
+EOF
+
+chmod +x /tmp/deploy_full.sh

@@ -22,7 +22,7 @@ send_log() {
 setup_ip_traffic_monitor() {
     send_log "INFO" "Setting up IP Traffic Monitor..."
     
-    BASE_DIR="/tmp/ip_traffic_test"
+    BASE_DIR="/tmp/ip_traffic"
     mkdir -p "$BASE_DIR"
     
     # Create the main iptables chains (ONLY ONCE during deployment)
@@ -131,14 +131,14 @@ deploy_upload_script() {
 #!/bin/sh
 PHONE_IP='192.168.1.13'
 PORT='8081'
-DIRS='/tmp/bandwidth /tmp/web_usage /tmp/ip_traffic_test'
+DIRS='/tmp/bandwidth /tmp/web_usage /tmp/ip_traffic'
 
 # Take bandwidth snapshot
 mkdir -p /tmp/bandwidth
 cat /proc/net/dev > /tmp/bandwidth/bandwidth_snapshot_$(date +%Y%m%d_%H%M%S).txt
 
 # Take IP traffic snapshot
-[ -f "/tmp/ip_traffic_test/ip_traffic_auto.sh" ] && /tmp/ip_traffic_test/ip_traffic_auto.sh
+[ -f "/tmp/ip_traffic/ip_traffic_auto.sh" ] && /tmp/ip_traffic_test/ip_traffic_auto.sh
 
 send_file() {
     file="$1"

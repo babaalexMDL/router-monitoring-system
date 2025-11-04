@@ -138,27 +138,25 @@ else
 fi
 
 # Check 2: iptables chain exists
-if iptables -t mangle -L TRAFFIC_TEST >/dev/null 2>&1; then
+if iptables -L TRAFFIC_TEST >/dev/null 2>&1; then
     log "✅ TRAFFIC_TEST chain exists"
+    
+    # Check 3: Chain has rules (not empty) - FIXED COUNTING
+    RULE_COUNT=$(iptables -L TRAFFIC_TEST -n 2>/dev/null | grep -c "^[A-Z]")
+    if [ "$RULE_COUNT" -gt 0 ]; then
+        log "✅ TRAFFIC_TEST chain has $RULE_COUNT rules"
+    else
+        log "❌ TRAFFIC_TEST chain is empty"
+        RESTART_NEEDED=1
+    fi
 else
     log "❌ TRAFFIC_TEST chain missing"
     RESTART_NEEDED=1
 fi
 
-# Check 3: Chain has rules (not empty)
-if [ $RESTART_NEEDED -eq 0 ]; then
-    RULE_COUNT=$(iptables -t mangle -L TRAFFIC_TEST -n 2>/dev/null | grep -c "^Chain")
-    if [ "$RULE_COUNT" -gt 0 ]; then
-        log "✅ TRAFFIC_TEST chain has rules"
-    else
-        log "❌ TRAFFIC_TEST chain is empty"
-        RESTART_NEEDED=1
-    fi
-fi
-
 # RESTART if needed
 if [ $RESTART_NEEDED -eq 1 ]; then
-    log "🚨 RESTARTING IP traffic monitor (reason: process=$([ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null && echo "running" || echo "dead"), chain=$(iptables -t mangle -L TRAFFIC_TEST >/dev/null 2>&1 && echo "exists" || echo "missing"))"
+    log "🚨 RESTARTING IP traffic monitor (reason: process=$([ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null && echo "running" || echo "dead"), chain=$(iptables -L TRAFFIC_TEST >/dev/null 2>&1 && echo "exists" || echo "missing"))"
 
     # Kill old monitor
     if [ -f "$PID_FILE" ]; then
@@ -168,38 +166,38 @@ if [ $RESTART_NEEDED -eq 1 ]; then
     fi
 
     # Cleanup iptables
-    iptables -t mangle -D INPUT -j TRAFFIC_TEST 2>/dev/null
-    iptables -t mangle -D FORWARD -j TRAFFIC_TEST 2>/dev/null
-    iptables -t mangle -F TRAFFIC_TEST 2>/dev/null
-    iptables -t mangle -X TRAFFIC_TEST 2>/dev/null
+    iptables -D INPUT -j TRAFFIC_TEST 2>/dev/null
+    iptables -D FORWARD -j TRAFFIC_TEST 2>/dev/null
+    iptables -F TRAFFIC_TEST 2>/dev/null
+    iptables -X TRAFFIC_TEST 2>/dev/null
 
     # Recreate everything
-    iptables -t mangle -N TRAFFIC_TEST
-    iptables -t mangle -I INPUT -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
-    iptables -t mangle -I FORWARD -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
+    iptables -N TRAFFIC_TEST
+    iptables -I INPUT -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
+    iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
 
     # Start enhanced monitor with error checking
     (
         while true; do
             # Ensure chain exists before adding rules
-            if ! iptables -t mangle -L TRAFFIC_TEST >/dev/null 2>&1; then
+            if ! iptables -L TRAFFIC_TEST >/dev/null 2>&1; then
                 echo "❌ TRAFFIC_TEST chain missing, recreating..." >> "$LOG_FILE"
-                iptables -t mangle -N TRAFFIC_TEST
-                iptables -t mangle -I INPUT -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
-                iptables -t mangle -I FORWARD -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
+                iptables -N TRAFFIC_TEST
+                iptables -I INPUT -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
+                iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
             fi
 
             DEVICES=$(awk 'NR>1 && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $3=="0x2" {print $1}' /proc/net/arp)
             
             # Clear and rebuild rules
-            iptables -t mangle -F TRAFFIC_TEST
+            iptables -F TRAFFIC_TEST
             
             for ip in $DEVICES; do
-                iptables -t mangle -A TRAFFIC_TEST -d "$ip"
-                iptables -t mangle -A TRAFFIC_TEST -s "$ip"
+                iptables -A TRAFFIC_TEST -d "$ip"
+                iptables -A TRAFFIC_TEST -s "$ip"
             done
             
-            iptables -t mangle -A TRAFFIC_TEST -j ACCEPT
+            iptables -A TRAFFIC_TEST -j ACCEPT
             sleep 60
         done
     ) >/dev/null 2>&1 &
@@ -211,7 +209,7 @@ if [ $RESTART_NEEDED -eq 1 ]; then
 
     # Verify
     sleep 2
-    if kill -0 "$NEW_PID" 2>/dev/null && iptables -t mangle -L TRAFFIC_TEST >/dev/null 2>&1; then
+    if kill -0 "$NEW_PID" 2>/dev/null && iptables -L TRAFFIC_TEST >/dev/null 2>&1; then
         log "✅ Restart verified successful"
         send_log "SUCCESS" "✅ IP Traffic Monitor restart successful"
     else
@@ -267,7 +265,7 @@ iptables -L TRAFFIC_TEST -v -n >> "$IP_OUTFILE"
 echo "" >> "$IP_OUTFILE"
 echo "==== PROCESSED TRAFFIC TOTALS ====" >> "$IP_OUTFILE"
 
-# Process IP traffic data
+# Process IP traffic data - FIXED VERSION
 iptables -L TRAFFIC_TEST -v -n 2>/dev/null | awk '
 /^[[:space:]]*[0-9]+[[:space:]]+[0-9]+/ {
     pkts = $1
@@ -275,8 +273,8 @@ iptables -L TRAFFIC_TEST -v -n 2>/dev/null | awk '
     ip_src = $8
     ip_dst = $9
     
-    # Skip the ACCEPT rule at the end
-    if ($3 == "ACCEPT") next
+    # 🔧 FIX: Only skip the final ACCEPT rule, not all ACCEPT targets
+    if (ip_src == "0.0.0.0/0" && ip_dst == "0.0.0.0/0" && $NF == "ACCEPT") next
     
     if (bytes > 0) {
         # Count traffic for destination IPs (download)
@@ -400,8 +398,8 @@ send_log "INFO" "🧹 ENHANCED cleanup script created"
 send_log "INFO" "📊 Running initial upload with ENHANCED processing..."
 /root/upload_logs.sh
 
-send_log "SUCCESS" "🎯 ENHANCED Router monitoring system fully deployed and ready!")"
-send_log "INFO" "📁 All files in /root/monitoring/ (permanent storage)")
-send_log "INFO" "🛡️ Watchdog integrated - auto-restarts if monitor dies")
-send_log "INFO" "💡 Run '/root/upload_logs.sh' manually for immediate data upload")
-send_log "INFO" "💡 Run '$IP_TRAFFIC_DIR/clean_monitor.sh' to stop monitoring")
+send_log "SUCCESS" "🎯 ENHANCED Router monitoring system fully deployed and ready!"
+send_log "INFO" "📁 All files in /root/monitoring/ (permanent storage)"
+send_log "INFO" "🛡️ Watchdog integrated - auto-restarts if monitor dies"
+send_log "INFO" "💡 Run '/root/upload_logs.sh' manually for immediate data upload"
+send_log "INFO" "💡 Run '$IP_TRAFFIC_DIR/clean_monitor.sh' to stop monitoring"

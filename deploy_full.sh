@@ -88,9 +88,9 @@ send_log "INFO" "📡 ENHANCED IP traffic monitor started (PID: $MONITOR_PID)"
 # === CREATE WATCHDOG SCRIPT ===
 send_log "INFO" "🛡️ Creating watchdog script..."
 
-cat > "$IP_TRAFFIC_DIR/watchdog.sh" <<'EOF'
+cat > /root/monitoring/ip_traffic/watchdog.sh <<'EOF'
 #!/bin/sh
-# IP Traffic Monitor Watchdog
+# ENHANCED IP Traffic Monitor Watchdog - Checks BOTH process AND iptables
 PHONE_IP='192.168.1.13'
 PORT='8081'
 
@@ -119,73 +119,111 @@ send_log() {
     } | nc -w 3 "$PHONE_IP" "$PORT" >/dev/null 2>&1
 }
 
-log "🔍 Watchdog check started"
+log "🔍 ENHANCED Watchdog check started"
 
-# Check if monitor is running
+RESTART_NEEDED=0
+
+# Check 1: Monitor process
 if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
     if kill -0 "$PID" 2>/dev/null; then
-        log "✅ Monitor running (PID: $PID)"
-        exit 0
+        log "✅ Monitor process running (PID: $PID)"
     else
         log "❌ Monitor PID exists but process dead (PID: $PID)"
+        RESTART_NEEDED=1
     fi
 else
     log "❌ No monitor PID file found"
+    RESTART_NEEDED=1
 fi
 
-# Check if iptables chain exists
-if ! iptables -L TRAFFIC_TEST >/dev/null 2>&1; then
-    log "❌ TRAFFIC_TEST chain missing"
-fi
-
-# RESTART MONITOR
-log "🚨 Restarting IP traffic monitor..."
-
-# Cleanup first
-iptables -D INPUT -j TRAFFIC_TEST 2>/dev/null
-iptables -D FORWARD -j TRAFFIC_TEST 2>/dev/null
-iptables -F TRAFFIC_TEST 2>/dev/null
-iptables -X TRAFFIC_TEST 2>/dev/null
-
-# Recreate chain
-iptables -N TRAFFIC_TEST
-iptables -I INPUT -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
-iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
-
-# Start monitor
-(
-    while true; do
-        DEVICES=$(awk 'NR>1 && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $3=="0x2" {print $1}' /proc/net/arp)
-        iptables -F TRAFFIC_TEST
-        
-        for ip in $DEVICES; do
-            iptables -A TRAFFIC_TEST -d "$ip"
-            iptables -A TRAFFIC_TEST -s "$ip"
-        done
-        
-        iptables -A TRAFFIC_TEST -j ACCEPT
-        sleep 60
-    done
-) >/dev/null 2>&1 &
-NEW_PID=$!
-echo $NEW_PID > "$PID_FILE"
-
-log "✅ Monitor restarted (PID: $NEW_PID)"
-send_log "WARNING" "🔄 IP Traffic Monitor was restarted by watchdog (was dead)"
-
-# Verify restart
-sleep 2
-if kill -0 "$NEW_PID" 2>/dev/null && iptables -L TRAFFIC_TEST >/dev/null 2>&1; then
-    log "✅ Restart verified successful"
-    send_log "SUCCESS" "✅ IP Traffic Monitor restart successful"
+# Check 2: iptables chain exists
+if iptables -t mangle -L TRAFFIC_TEST >/dev/null 2>&1; then
+    log "✅ TRAFFIC_TEST chain exists"
 else
-    log "❌ Restart verification failed"
-    send_log "ERROR" "❌ IP Traffic Monitor restart failed"
+    log "❌ TRAFFIC_TEST chain missing"
+    RESTART_NEEDED=1
+fi
+
+# Check 3: Chain has rules (not empty)
+if [ $RESTART_NEEDED -eq 0 ]; then
+    RULE_COUNT=$(iptables -t mangle -L TRAFFIC_TEST -n 2>/dev/null | grep -c "^Chain")
+    if [ "$RULE_COUNT" -gt 0 ]; then
+        log "✅ TRAFFIC_TEST chain has rules"
+    else
+        log "❌ TRAFFIC_TEST chain is empty"
+        RESTART_NEEDED=1
+    fi
+fi
+
+# RESTART if needed
+if [ $RESTART_NEEDED -eq 1 ]; then
+    log "🚨 RESTARTING IP traffic monitor (reason: process=$([ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null && echo "running" || echo "dead"), chain=$(iptables -t mangle -L TRAFFIC_TEST >/dev/null 2>&1 && echo "exists" || echo "missing"))"
+
+    # Kill old monitor
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE")
+        kill "$PID" 2>/dev/null
+        rm -f "$PID_FILE"
+    fi
+
+    # Cleanup iptables
+    iptables -t mangle -D INPUT -j TRAFFIC_TEST 2>/dev/null
+    iptables -t mangle -D FORWARD -j TRAFFIC_TEST 2>/dev/null
+    iptables -t mangle -F TRAFFIC_TEST 2>/dev/null
+    iptables -t mangle -X TRAFFIC_TEST 2>/dev/null
+
+    # Recreate everything
+    iptables -t mangle -N TRAFFIC_TEST
+    iptables -t mangle -I INPUT -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
+    iptables -t mangle -I FORWARD -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
+
+    # Start enhanced monitor with error checking
+    (
+        while true; do
+            # Ensure chain exists before adding rules
+            if ! iptables -t mangle -L TRAFFIC_TEST >/dev/null 2>&1; then
+                echo "❌ TRAFFIC_TEST chain missing, recreating..." >> "$LOG_FILE"
+                iptables -t mangle -N TRAFFIC_TEST
+                iptables -t mangle -I INPUT -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
+                iptables -t mangle -I FORWARD -m state --state ESTABLISHED,RELATED -j TRAFFIC_TEST
+            fi
+
+            DEVICES=$(awk 'NR>1 && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $3=="0x2" {print $1}' /proc/net/arp)
+            
+            # Clear and rebuild rules
+            iptables -t mangle -F TRAFFIC_TEST
+            
+            for ip in $DEVICES; do
+                iptables -t mangle -A TRAFFIC_TEST -d "$ip"
+                iptables -t mangle -A TRAFFIC_TEST -s "$ip"
+            done
+            
+            iptables -t mangle -A TRAFFIC_TEST -j ACCEPT
+            sleep 60
+        done
+    ) >/dev/null 2>&1 &
+    
+    NEW_PID=$!
+    echo $NEW_PID > "$PID_FILE"
+    log "✅ Monitor restarted (PID: $NEW_PID)"
+    send_log "WARNING" "🔄 IP Traffic Monitor restarted by enhanced watchdog"
+
+    # Verify
+    sleep 2
+    if kill -0 "$NEW_PID" 2>/dev/null && iptables -t mangle -L TRAFFIC_TEST >/dev/null 2>&1; then
+        log "✅ Restart verified successful"
+        send_log "SUCCESS" "✅ IP Traffic Monitor restart successful"
+    else
+        log "❌ Restart verification failed"
+        send_log "ERROR" "❌ IP Traffic Monitor restart failed"
+    fi
+else
+    log "✅ All checks passed - no restart needed"
 fi
 EOF
 
-chmod +x "$IP_TRAFFIC_DIR/watchdog.sh"
+chmod +x /root/monitoring/ip_traffic/watchdog.sh
 send_log "INFO" "🛡️ Watchdog script created: $IP_TRAFFIC_DIR/watchdog.sh"
 
 # === ENHANCED UPLOAD SCRIPT WITH WATCHDOG INTEGRATION ===
